@@ -205,3 +205,26 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Medical data (never commit PHI!)
+data/
+test_data/
+*.pdf
+*.png
+*.jpg
+medical_charts/
+
+# Model files (too large for git)
+models/
+*.bin
+*.gguf
+*.safetensors
+
+# Audit logs (potentially sensitive)
+logs/
+*.log
+audit_logs/
+
+# Config files with secrets
+config.yaml
+secrets.json
