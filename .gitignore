@@ -208,10 +208,6 @@ __marimo__/
 
 # Medical data (never commit PHI!)
 data/
-test_data/
-*.pdf
-*.png
-*.jpg
 medical_charts/
 
 # Model files (too large for git)

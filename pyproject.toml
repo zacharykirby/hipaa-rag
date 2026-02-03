@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hipaa-rag"
+version = "0.1.0"
+description = "HIPAA-compliant RAG framework for medical documents"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "Zach", email = "your.email@example.com"}
+]
+dependencies = [
+    "python-dotenv>=1.0.0",
+    "Pillow>=10.0.0",
+    "openai>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
