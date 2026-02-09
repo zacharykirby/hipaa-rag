@@ -11,21 +11,38 @@ from typing import Optional, Dict, Any
 from dataclasses import dataclass
 from openai import OpenAI
 
+from .loader import get_pages, get_page_count
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Field names treated as list-like (concat + dedupe when merging multi-page extraction)
+LIST_LIKE_FIELDS = frozenset(
+    k.lower()
+    for k in (
+        "medications",
+        "prescribed_medications",
+        "diagnoses",
+        "allergies",
+        "conditions",
+        "problems",
+    )
+)
 
 
 @dataclass
 class QueryResult:
     """Result from a medical chart query"""
+
     question: str
     answer: str
     timestamp: datetime
     tokens_used: Optional[int] = None
     model: Optional[str] = None
     document_path: Optional[str] = None
-    
+    page_count: Optional[int] = None
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for logging/serialization"""
         return {
@@ -34,7 +51,8 @@ class QueryResult:
             "timestamp": self.timestamp.isoformat(),
             "tokens_used": self.tokens_used,
             "model": self.model,
-            "document_path": self.document_path
+            "document_path": self.document_path,
+            "page_count": self.page_count,
         }
 
 
@@ -102,126 +120,224 @@ class SecureRAG:
         
         logger.info(f"SecureRAG initialized with base_url={self.base_url}, model={self.model}")
     
-    def _encode_image(self, image_path: str) -> str:
-        """Encode image to base64"""
-        with open(image_path, "rb") as f:
-            return base64.b64encode(f.read()).decode('utf-8')
-    
+    def _query_single_image(
+        self,
+        base64_image: str,
+        question: str,
+        temperature: float = 0.1,
+        max_tokens: int = 500,
+    ) -> tuple[str, Optional[int]]:
+        """Call vision API with one image. Returns (answer, tokens_used)."""
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": question},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/png;base64,{base64_image}"
+                            },
+                        },
+                    ],
+                }
+            ],
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+        answer = response.choices[0].message.content
+        tokens_used = (
+            response.usage.total_tokens if hasattr(response, "usage") else None
+        )
+        return (answer or "", tokens_used)
+
     def query(
         self,
         document: str,
         question: str,
         temperature: float = 0.1,
-        max_tokens: int = 500
+        max_tokens: int = 500,
+        max_pages: Optional[int] = None,
     ) -> QueryResult:
         """
-        Query a medical document
-        
+        Query a medical document (image, PDF, or multi-page TIFF).
+
         Args:
-            document: Path to medical document image
+            document: Path to document (PNG, JPEG, PDF, TIFF, etc.)
             question: Question to ask about the document
             temperature: Model temperature (lower = more focused)
-            max_tokens: Maximum tokens in response
-            
+            max_tokens: Maximum tokens per page response
+            max_pages: Optional cap on pages processed (e.g. for very large PDFs)
+
         Returns:
-            QueryResult with answer and metadata
+            QueryResult with combined answer and metadata
         """
-        logger.info(f"Querying document: {document}")
+        document_path = str(Path(document).resolve())
+        logger.info(f"Querying document: {document_path}")
         logger.info(f"Question: {question}")
-        
-        # Encode image
-        try:
-            base64_image = self._encode_image(document)
-        except Exception as e:
-            logger.error(f"Failed to encode image: {e}")
-            raise
-        
-        # Make API call
-        try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": question},
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/png;base64,{base64_image}"
-                                }
-                            }
-                        ]
-                    }
-                ],
-                max_tokens=max_tokens,
-                temperature=temperature
-            )
-            
-            answer = response.choices[0].message.content
-            tokens_used = response.usage.total_tokens if hasattr(response, 'usage') else None
-            
-            logger.info(f"Query successful. Tokens used: {tokens_used}")
-            
-        except Exception as e:
-            logger.error(f"Query failed: {e}")
-            raise
-        
-        # Create result
+
+        page_answers: list[str] = []
+        total_tokens = 0
+
+        for page_idx, png_bytes in get_pages(document_path, max_pages=max_pages):
+            base64_image = base64.b64encode(png_bytes).decode("utf-8")
+            try:
+                answer, tokens_used = self._query_single_image(
+                    base64_image,
+                    question,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+                page_answers.append(answer)
+                if tokens_used is not None:
+                    total_tokens += tokens_used
+                logger.debug(f"Page {page_idx + 1} done. Tokens: {tokens_used}")
+            except Exception as e:
+                logger.error(f"Query failed on page {page_idx + 1}: {e}")
+                raise
+
+        if not page_answers:
+            raise ValueError(f"No pages processed for document: {document_path}")
+
+        # Combine answers
+        if len(page_answers) == 1:
+            combined = page_answers[0]
+        else:
+            parts = [
+                f"--- Page {i + 1} ---\n{a}"
+                for i, a in enumerate(page_answers)
+                if (a and a.strip())
+            ]
+            combined = "\n\n".join(parts)
+
+        page_count = len(page_answers)
+        logger.info(f"Query successful. Pages: {page_count}, Tokens: {total_tokens}")
+
         result = QueryResult(
             question=question,
-            answer=answer,
+            answer=combined,
             timestamp=datetime.now(),
-            tokens_used=tokens_used,
+            tokens_used=total_tokens or None,
             model=self.model,
-            document_path=document
+            document_path=document_path,
+            page_count=page_count,
         )
-        
-        # Audit log
+
         if self.enable_audit_log:
             self._log_query(result)
-        
+
         return result
     
     def _log_query(self, result: QueryResult):
-        """Log query to audit trail"""
+        """Log query to audit trail (one entry per document)."""
+        doc_part = result.document_path or ""
+        if result.page_count is not None and result.page_count > 1:
+            doc_part = f"{doc_part} ({result.page_count} pages)"
         log_entry = (
-            f"QUERY | Document: {result.document_path} | "
+            f"QUERY | Document: {doc_part} | "
             f"Question: {result.question} | "
             f"Tokens: {result.tokens_used} | "
             f"Model: {result.model}"
         )
         self.audit_logger.info(log_entry)
-    
-    def extract_structured_data(self,
-                                document: str,
-                                fields: list[str]) -> Dict[str, str]:
-        """Extract specific fields from a medical document as JSON"""
-    
-        fields_str = ", ".join([f'"{field}"' for field in fields])
+
+    def _parse_extraction_response(self, response_text: str) -> Dict[str, Any]:
+        """Parse JSON from model response (strip markdown code fence if present)."""
+        text = response_text.strip()
+        if text.startswith("```"):
+            parts = text.split("```")
+            if len(parts) >= 2:
+                text = parts[1]
+                if text.startswith("json"):
+                    text = text[4:]
+        text = text.strip()
+        return json.loads(text)
+
+    def _merge_extracted_pages(
+        self, page_dicts: list[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """Merge per-page extraction dicts: first non-empty for scalars, concat+dedupe for list-like."""
+        merged: Dict[str, Any] = {}
+        for d in page_dicts:
+            if not isinstance(d, dict):
+                continue
+            for k, v in d.items():
+                key_lower = k.lower()
+                if key_lower in LIST_LIKE_FIELDS:
+                    # List-like: collect all values, dedupe
+                    if not isinstance(v, list):
+                        v = [v] if v not in (None, "") else []
+                    existing = merged.get(k)
+                    if existing is None:
+                        merged[k] = list(dict.fromkeys(str(x).strip() for x in v if x))
+                    else:
+                        if not isinstance(existing, list):
+                            existing = [existing]
+                        merged[k] = list(
+                            dict.fromkeys(
+                                existing + [str(x).strip() for x in v if x]
+                            )
+                        )
+                else:
+                    # First non-empty wins
+                    if k not in merged or not merged[k]:
+                        if v is not None and str(v).strip():
+                            merged[k] = v
+        return merged
+
+    def extract_structured_data(
+        self,
+        document: str,
+        fields: list[str],
+        max_pages: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        Extract specific fields from a medical document (image, PDF, or TIFF).
+        Multi-page: merges per-page JSON (first non-empty for scalars, concat+dedupe for list-like fields).
+        """
+        fields_str = ", ".join([f'"{f}"' for f in fields])
+        example = ",\n  ".join([f'"{f}": "value"' for f in fields])
         prompt = (
             f"Extract the following information from this medical chart: {fields_str}.\n\n"
             f"Return the answer as valid JSON only, with no other text:\n"
-            f'{{\n  "patient_name": "value",\n  "date_of_birth": "value",\n  '
-            f'"primary_diagnosis": "value",\n  "prescribed_medications": "value"\n}}'
+            f"{{\n  {example}\n}}"
         )
-        
-        result = self.query(document, prompt, max_tokens=300, temperature=0.0)
-        
-        # Try to parse JSON from response
-        try:
-            # Sometimes model wraps in ```json, clean that
-            response_text = result.answer.strip()
-            if response_text.startswith('```'):
-                response_text = response_text.split('```')[1]
-                if response_text.startswith('json'):
-                    response_text = response_text[4:]
-            response_text = response_text.strip()
-            
-            extracted = json.loads(response_text)
-            logger.info(f"Extracted {len(extracted)} fields: {list(extracted.keys())}")
-            return extracted
-        except json.JSONDecodeError as e:
-            logger.warning(f"Failed to parse JSON response: {e}")
-            logger.warning(f"Raw response: {result.answer}")
+
+        document_path = str(Path(document).resolve())
+        page_dicts: list[Dict[str, Any]] = []
+
+        for page_idx, png_bytes in get_pages(document_path, max_pages=max_pages):
+            base64_image = base64.b64encode(png_bytes).decode("utf-8")
+            answer, _ = self._query_single_image(
+                base64_image,
+                prompt,
+                max_tokens=300,
+                temperature=0.0,
+            )
+            try:
+                parsed = self._parse_extraction_response(answer)
+                page_dicts.append(parsed)
+            except json.JSONDecodeError as e:
+                logger.warning(
+                    f"Failed to parse JSON from page {page_idx + 1}: {e}. Raw: {answer[:200]}"
+                )
+
+        if not page_dicts:
             return {}
+
+        merged = self._merge_extracted_pages(page_dicts)
+        logger.info(
+            f"Extracted {len(merged)} fields from {len(page_dicts)} page(s): {list(merged.keys())}"
+        )
+
+        # Audit: one entry for the whole document
+        if self.enable_audit_log:
+            page_count = len(page_dicts)
+            doc_part = f"{document_path} ({page_count} pages)" if page_count > 1 else document_path
+            self.audit_logger.info(
+                f"EXTRACT | Document: {doc_part} | Fields: {list(merged.keys())} | Model: {self.model}"
+            )
+
+        return merged
